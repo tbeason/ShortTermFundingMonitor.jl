@@ -5,14 +5,13 @@ module ShortTermFundingMonitor
 
 using Downloads: request
 using JSON3
-using JSONTables
 using DataFrames
 using CodecZlib
 using Dates
 
 
 export stfmapicall, stfmmetadataquery, stfmavailablemnemonics, stfmsearchquery
-export stfmdatasetdata
+export stfmdatasetdata, stfmseriesdata, stfmsingleseriesdata, stfmseriesspread
 
 
 
@@ -49,7 +48,7 @@ function stfmavailablemnemonics(dataset=nothing; parse=true, timeout=Inf, verbos
     point = isnothing(dataset) ? "/metadata/mnemonics?output=by_dataset" : "/metadata/mnemonics?dataset=$dataset"
     js = stfmapicall(string(STFM_BASEURL,STFM_API_STABLE,point);timeout,verbose)
     parse == false && return js
-    df = isnothing(dataset) ? mapreduce(_pair2table,vcat,pairs(js)) : DataFrame(jsontable(js))
+    df = isnothing(dataset) ? mapreduce(_pair2table,vcat,pairs(js)) : DataFrame(values(js))
     return df
 end
 
@@ -94,47 +93,55 @@ function stfmdatasetdata(dataset::AbstractString; parse=true,timeout=Inf,verbose
     js = stfmapicall(string(STFM_BASEURL,STFM_API_STABLE,query);timeout,verbose)
     parse == false && return js
 
-    jst = js.timeseries
-    mnemonics = keys(jst)
-    metadatadict = Dict{String,Dict{Symbol,Any}}()
-    df = DataFrame()
-    for m in mnemonics
-        for k in keys(jst[m])
-            if k == :metadata 
-                push!(metadatadict,string(m) => Dict(jst[m][k]))
-            else
-                for j in keys(jst[m][k])
-                    dftmp = _parsetimeseries(jst[m][k][j];mnemonic=string(m),label=string(j))
-                    df = vcat(df,dftmp)
-                end
-            end
-        end
-    end
-
+    metadatadict = _constructmetadatadict(js.timeseries)
+    df = _constructmultiseriesdata(js.timeseries)
+    
     return (data=df,metadata=metadatadict)
 end
 
-function _constructparams(;start_date=nothing,end_date=nothing,periodicity=nothing,how=nothing,remove_nulls=nothing,time_format=nothing)
-    str = ""
-    !isnothing(start_date)      && (str *= string("&start_date=",start_date))
-    !isnothing(end_date)        && (str *= string("&end_date=",end_date))
-    !isnothing(periodicity)     && (str *= string("&periodicity=",periodicity))
-    !isnothing(how)             && (str *= string("&how=",how))
-    !isnothing(remove_nulls)    && (str *= string("&remove_nulls=",remove_nulls))
-    !isnothing(time_format)     && (str *= string("&time_format=",time_format))
-    return str
-end
 
 
 
-
-function stfmseriesdata(mnemonics;endpoint="multifull")
-    L = length(mnemonics)
-
+function stfmseriesdata(mnemonics;endpoint="multifull",parse=true,timeout=Inf,verbose=false,
+    start_date=nothing,end_date=nothing,periodicity=nothing,how=nothing,remove_nulls=nothing,time_format=nothing)
+    mstr = mnemonics isa String ? mnemonics : join(mnemonics,",")
+    @assert !isempty(mstr) "Requires at least 1 mnemonic as input."
+    mflag = isequal(endpoint,"timeseries") ? "mnemonic" : "mnemonics"
+    query = string("/series/",endpoint,"?",mflag,"=",mstr) *  _constructparams(;start_date,end_date,periodicity,how,remove_nulls,time_format) 
+    js = stfmapicall(string(STFM_BASEURL,STFM_API_STABLE,query);timeout,verbose)
+    parse == false && return js
     
-
+    metadatadict = _constructmetadatadict(js)
+    df = _constructmultiseriesdata(js)
+    
+    return (data=df,metadata=metadatadict)
 end
 
+function stfmsingleseriesdata(mnemonic,label=nothing;add_ids=false,parse=true,timeout=Inf,verbose=false,
+    start_date=nothing,end_date=nothing,periodicity=nothing,how=nothing,remove_nulls=nothing,time_format=nothing)
+    query = string("/series/timeseries?mnemonic=",mnemonic) *  _constructparams(;start_date,end_date,periodicity,how,remove_nulls,time_format) 
+    if !isnothing(label)
+        query *= string("&label=",label) 
+    end
+    js = stfmapicall(string(STFM_BASEURL,STFM_API_STABLE,query);timeout,verbose)
+    parse == false && return js
+
+    df = add_ids ? _parsetimeseries(js;mnemonic,label) : _parsetimeseries(js)
+
+    return df
+end
+
+function stfmseriesspread(xmnemonic,ymnenomic;add_ids=false,parse=true,timeout=Inf,verbose=false,
+    start_date=nothing,end_date=nothing,periodicity=nothing,how=nothing,remove_nulls=nothing,time_format=nothing)
+    query = string("/calc/spread?x=",xmnemonic,"&y=",ymnenomic) *  _constructparams(;start_date,end_date,periodicity,how,remove_nulls,time_format) 
+    js = stfmapicall(string(STFM_BASEURL,STFM_API_STABLE,query);timeout,verbose)
+    parse == false && return js
+
+    df = add_ids ? _parsetimeseries(js;mnemonic=xmnemonic,label=ymnenomic) : _parsetimeseries(js)
+    add_ids && rename!(df,"mnemonic"=>"xmnemonic","label"=>"ymnenomic")
+
+    return df
+end
 
 
 
@@ -152,7 +159,7 @@ end
 
 function _pair2table(p)
     key,values = p
-    df = DataFrame(jsontable(values))
+    df = DataFrame(NamedTuple.(values))
     df[!,"dataset"] .= string(key)
     select!(df,"dataset",:)
     return df
@@ -160,7 +167,7 @@ end
 
 
 function _parsetimeseries(x; mnemonic=nothing, label=nothing)
-    date=Date.(first.(x))
+    date = first(first(x)) isa Int ? first.(x) : Date.(first.(x))
     v = replace(last.(x),nothing=>missing)
     v = v * 1.0             # converts to Float64
     if all(!ismissing,v)
@@ -180,7 +187,47 @@ function _parsetimeseries(x; mnemonic=nothing, label=nothing)
     return df
 end
 
+function _constructparams(;start_date=nothing,end_date=nothing,periodicity=nothing,how=nothing,remove_nulls=nothing,time_format=nothing)
+    str = ""
+    !isnothing(start_date)      && (str *= string("&start_date=",start_date))
+    !isnothing(end_date)        && (str *= string("&end_date=",end_date))
+    !isnothing(periodicity)     && (str *= string("&periodicity=",periodicity))
+    !isnothing(how)             && (str *= string("&how=",how))
+    !isnothing(remove_nulls)    && (str *= string("&remove_nulls=",remove_nulls))
+    !isnothing(time_format)     && (str *= string("&time_format=",time_format))
+    return str
+end
 
 
+
+function _constructmultiseriesdata(jst)
+    mnemonics = keys(jst)
+    df = DataFrame()
+    for m in mnemonics
+        for k in keys(jst[m])
+            if k != :metadata 
+                for j in keys(jst[m][k])
+                    dftmp = _parsetimeseries(jst[m][k][j];mnemonic=string(m),label=string(j))
+                    df = vcat(df,dftmp)
+                end
+            end
+        end
+    end
+    return df
+end
+
+
+function _constructmetadatadict(jst)
+    mnemonics = keys(jst)
+    metadatadict = Dict{String,Dict{Symbol,Any}}()
+    for m in mnemonics
+        for k in keys(jst[m])
+            if k == :metadata 
+                push!(metadatadict,string(m) => Dict(jst[m][k]))
+            end
+        end
+    end
+    return metadatadict
+end
 
 end # module
